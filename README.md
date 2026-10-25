@@ -12,9 +12,9 @@ Open your terminal (PowerShell/CMD) and pull the default model:
 Clone this repository or download the ZIP. Open your terminal in the project folder, and run:
 - pip install -r requirements.txt
 
-###4. Download the spaCy Language Model
+### 4. Download the spaCy Language Model
 This step is mandatory (requirements.txt cannot install it directly):
 - python -m spacy download en_core_web_sm
 
-###5. Run the Dashboard
+### 5. Run the Dashboard
 - streamlit run dashboard.py
