@@ -1,0 +1,6 @@
+streamlit
+ollama
+spacy
+plotly
+pandas
+requests
