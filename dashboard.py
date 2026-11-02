@@ -1,41 +1,58 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import trust_radar
+"""dashboard.py -- interactive Trust Radar demo.
+
+Run with:  streamlit run dashboard.py
+
+The maths lives in radar_core.py (shared with the batch evaluation) and the
+single-question pipeline lives in trust_radar.py.  This file only renders.
+"""
+
 from html import escape
 
-#three color green yellow red
-def score_to_color(avg: float) -> str:
-    if avg >= 0.80:
-        return "#c8e6c9"
-    if avg >= 0.50:
-        return "#fff9c4"
-    return "#ffcdd2"
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
-def render_annotated(text: str, entities: list):
+import radar_core as core
+import trust_radar
+
+
+def render_annotated(text: str, entities: list) -> None:
+    """Print the answer with each factual entity coloured by its confidence."""
     entities = sorted(entities, key=lambda e: e["start"])
     parts = []
     cursor = 0
     for ent in entities:
         if ent["start"] > cursor:
             parts.append(escape(text[cursor:ent["start"]]))
-        color = score_to_color(ent["avg"])
-        label = f"{ent['label']} | avg={ent['avg']:.2f} min={ent['min']:.2f}"
+        colour = core.entity_color(ent["avg"])
+        tooltip = f"{ent['label']} | avg={ent['avg']:.2f} min={ent['min']:.2f}"
         parts.append(
-            f'<span style="background-color:{color}; padding:2px 5px; '
-            f'border-radius:4px;" title="{label}">{escape(ent["text"])}</span>'
+            f'<span style="background-color:{colour}; padding:2px 5px; '
+            f'border-radius:4px;" title="{tooltip}">{escape(ent["text"])}</span>'
         )
         cursor = ent["end"]
     if cursor < len(text):
         parts.append(escape(text[cursor:]))
     st.markdown("".join(parts), unsafe_allow_html=True)
 
-# ---------- UI  ----------
+
+def level_box(level: str, message: str) -> None:
+    if level == "success":
+        st.success(message)
+    elif level == "warning":
+        st.warning(message)
+    else:
+        st.error(message)
+
+
+# ---------- page ----------
 st.set_page_config(page_title="Trust Radar", layout="wide")
 st.title("Trust Radar")
 st.caption(
-    "Token logprobs are mapped to factual entities. "
-    "Green = high (>=0.80), Yellow = medium (0.50-0.80), Red = low (<0.50)."
+    f"Entity colour = mean token probability "
+    f"(green >= {core.ENTITY_SAFE:.2f}, yellow >= {core.ENTITY_UNSURE:.2f}, red below). "
+    f"SINdex is a normalised semantic-inconsistency score: "
+    f"below {core.SINDEX_STABLE:.2f} samples agree, above {core.SINDEX_HIGH:.2f} they disagree."
 )
 
 with st.sidebar:
@@ -46,7 +63,7 @@ with st.sidebar:
         value="The first person to walk on the Moon was",
         height=100,
     )
-    n_samples = st.slider("Multi-sample count", min_value=3, max_value=5, value=5)
+    n_samples = st.slider("Multi-sample count", min_value=3, max_value=10, value=5)
     run = st.button("Generate & Analyze", type="primary")
 
 if run:
@@ -55,9 +72,12 @@ if run:
             result = trust_radar.analyze(model, prompt)
             text = result["text"]
             entities = result["entities"]
-        except Exception as e:
-            st.error(f"Error in single-sample analysis: {e}")
+        except Exception as exc:                      # noqa: BLE001
+            st.error(f"Error in single-sample analysis: {exc}")
             st.stop()
+
+    if result.get("alignment") not in (None, "exact"):
+        st.caption(f"note: token alignment fell back to '{result['alignment']}'")
 
     st.subheader("Generated Text")
     if entities:
@@ -71,9 +91,8 @@ if run:
             {
                 "Entity": e["text"],
                 "Type": e["label"],
-                "Avg Prob": round(e["avg"], 3),
-                "Min Prob": round(e["min"], 3),
-                "Tokens": " ".join(e["tokens"]),
+                "Mean prob": round(e["avg"], 3),
+                "Min prob": round(e["min"], 3),
             }
             for e in entities
         ]
@@ -81,35 +100,43 @@ if run:
 
         df = pd.DataFrame(rows)
         fig = px.bar(
-            df, x="Entity", y="Avg Prob", color="Type",
-            range_y=[0, 1], title="Entity Confidence Scores",
+            df, x="Entity", y="Mean prob", color="Type",
+            range_y=[0, 1], title="Entity confidence (mean token probability)",
         )
-        fig.add_hline(y=0.80, line_dash="dash", line_color="green")
-        fig.add_hline(y=0.50, line_dash="dash", line_color="orange")
+        fig.add_hline(y=core.ENTITY_SAFE, line_dash="dash", line_color="green")
+        fig.add_hline(y=core.ENTITY_UNSURE, line_dash="dash", line_color="orange")
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No factual entities detected in the generated text.")
 
-    st.subheader("Multi-Sample Consistency")
-    with st.spinner(f"Running {n_samples} samples, please wait..."):
+    # ---------- one consistency verdict, not two ----------
+    st.subheader("Cross-Sample Consistency")
+    with st.spinner(f"Sampling {n_samples} answers, please wait..."):
         try:
             ms = trust_radar.multi_sample_check(model, prompt, n=n_samples)
-        except Exception as e:
-            st.error(f"Error in multi-sample analysis: {e}")
+        except Exception as exc:                      # noqa: BLE001
+            st.error(f"Error in multi-sample analysis: {exc}")
             st.stop()
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Consistency", f"{ms['consistency']:.2f}")
-    col2.metric("Unique answers", ms["unique_count"])
-    col3.metric("Top answer", ms["top_entity"][:20])
+    col1.metric("Exact agreement", f"{ms['consistency']:.0%}")
+    col2.metric("Semantic clusters", ms["sindex_n_clusters"])
+    col3.metric("Top answer", (ms["top_entity"] or "-")[:20])
 
-    if ms["level"] == "success":
-        st.success(ms["verdict"])
-    elif ms["level"] == "warning":
-        st.warning(ms["verdict"])
-    else:
-        st.error(ms["verdict"])
+    level_box(ms["level"], f"SINdex {ms['sindex']:.2f} — {ms['verdict']}")
 
     with st.expander(f"Show {n_samples} sampled answers"):
         for i, ans in enumerate(ms["samples"], 1):
-            st.write(f"**{i}.** {ans[:150]}")
+            st.write(f"**{i}.** {(ans or '(empty)')[:200]}")
+
+    with st.expander("Semantic cluster details"):
+        st.caption(
+            "Coherence = mean pairwise similarity inside a cluster. "
+            "Singletons have no internal disagreement, so coherence is 1.0 by convention."
+        )
+        for c in ms["sindex_clusters"]:
+            st.write(
+                f"**{(c['answer'] or '(empty)')[:60]}** — "
+                f"size={c['size']}, coherence={c['coherence']}, "
+                f"share={c['p']}, weight={c['weight']}"
+            )
