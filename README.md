@@ -1,4 +1,4 @@
-# trust-radar-backup
+# trust-radar
 
 A confidence radar for LLM answers. Ask a local model a factual question; the
 dashboard colours every name, number and date by how sure the model was about
