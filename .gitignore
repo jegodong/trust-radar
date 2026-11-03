@@ -221,10 +221,3 @@ __marimo__/
 
 # local embedding model (930 MB)
 all-MiniLM-L6-v2/
-
-# evaluation outputs, not part of the dashboard
-trust_eval.py
-data/
-results/
-figures/
-cache/
