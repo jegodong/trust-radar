@@ -1,142 +1,151 @@
-"""dashboard.py -- interactive Trust Radar demo.
+"""trust_radar.py -- single-question pipeline behind the dashboard.
 
-Run with:  streamlit run dashboard.py
+All confidence and consistency maths lives in radar_core.py so that the
+dashboard and the batch evaluation (trust_eval.py) can never disagree.
 
-The maths lives in radar_core.py (shared with the batch evaluation) and the
-single-question pipeline lives in trust_radar.py.  This file only renders.
+Public functions
+----------------
+    analyze(model, prompt)               one greedy answer + per-entity scores
+    multi_sample_check(model, prompt, n) N sampled answers + one verdict
 """
 
-from html import escape
+import json
+import math
+import os
 
-import pandas as pd
-import plotly.express as px
-import streamlit as st
+import ollama
+import spacy
 
 import radar_core as core
-import trust_radar
 
+DEFAULT_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 
-def render_annotated(text: str, entities: list) -> None:
-    """Print the answer with each factual entity coloured by its confidence."""
-    entities = sorted(entities, key=lambda e: e["start"])
-    parts = []
-    cursor = 0
-    for ent in entities:
-        if ent["start"] > cursor:
-            parts.append(escape(text[cursor:ent["start"]]))
-        colour = core.entity_color(ent["avg"])
-        tooltip = f"{ent['label']} | avg={ent['avg']:.2f} min={ent['min']:.2f}"
-        parts.append(
-            f'<span style="background-color:{colour}; padding:2px 5px; '
-            f'border-radius:4px;" title="{tooltip}">{escape(ent["text"])}</span>'
-        )
-        cursor = ent["end"]
-    if cursor < len(text):
-        parts.append(escape(text[cursor:]))
-    st.markdown("".join(parts), unsafe_allow_html=True)
+nlp = spacy.load("en_core_web_sm")
 
+FACTUAL_ENTITIES = {
+    "PERSON", "GPE", "LOC", "ORG", "DATE",
+    "CARDINAL", "MONEY", "PERCENT", "QUANTITY",
+    "EVENT", "FAC", "NORP", "LAW",
+}
 
-def level_box(level: str, message: str) -> None:
-    if level == "success":
-        st.success(message)
-    elif level == "warning":
-        st.warning(message)
-    else:
-        st.error(message)
-
-
-# ---------- page ----------
-st.set_page_config(page_title="Trust Radar", layout="wide")
-st.title("Trust Radar")
-st.caption(
-    f"Entity colour = mean token probability "
-    f"(green >= {core.ENTITY_SAFE:.2f}, yellow >= {core.ENTITY_UNSURE:.2f}, red below). "
-    f"SINdex is a normalised semantic-inconsistency score: "
-    f"below {core.SINDEX_STABLE:.2f} samples agree, above {core.SINDEX_HIGH:.2f} they disagree."
+MONTHS = (
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
 )
 
-with st.sidebar:
-    st.header("Input")
-    model = st.text_input("Model", value="qwen2.5:3b")
-    prompt = st.text_area(
-        "Prompt",
-        value="The first person to walk on the Moon was",
-        height=100,
-    )
-    n_samples = st.slider("Multi-sample count", min_value=3, max_value=10, value=5)
-    run = st.button("Generate & Analyze", type="primary")
 
-if run:
-    with st.spinner("Generating and analyzing single sample..."):
+def is_factual_date(text: str) -> bool:
+    """Keep "1912" and "March 2020"; drop "yesterday" and "last week"."""
+    if any(ch.isdigit() for ch in text):
+        return True
+    low = text.lower()
+    return any(month in low for month in MONTHS)
+
+
+def analyze(model: str, prompt: str) -> dict:
+    """One deterministic answer, with every factual entity scored."""
+    response = ollama.generate(model=model, prompt=prompt, logprobs=True, top_logprobs=3)
+    text = response["response"]
+
+    tokens = []
+    for item in response.get("logprobs") or []:
+        if item.get("logprob") is None:
+            continue
+        tokens.append({"token": item.get("token", ""), "p": math.exp(float(item["logprob"]))})
+
+    spans, status = core.align_tokens(text, tokens)
+    if spans is None:
+        return {"text": text, "entities": [], "alignment": status}
+
+    doc = nlp(text)
+    entities = []
+    for ent in doc.ents:
+        if ent.label_ not in FACTUAL_ENTITIES:
+            continue
+        if ent.label_ == "DATE" and not is_factual_date(ent.text):
+            continue
+        probs = [p for start, end, p in spans if start < ent.end_char and end > ent.start_char]
+        if not probs:
+            continue
+        entities.append({
+            "text": ent.text,
+            "label": ent.label_,
+            "start": int(ent.start_char),
+            "end": int(ent.end_char),
+            "avg": sum(probs) / len(probs),
+            "min": min(probs),
+            "tokens": [text[start:end] for start, end, _ in spans
+                       if start < ent.end_char and end > ent.start_char],
+        })
+
+    return {"text": text, "entities": entities, "alignment": status}
+
+
+def get_embedder():
+    return core.get_embedder()
+
+
+def compute_sindex(answers, distance_threshold=None) -> dict:
+    """
+    Semantic inconsistency of a bag of answers.
+
+    Thin wrapper over radar_core.consistency_report so the dashboard and
+    results.csv report the same score.  The old version mixed cluster
+    coherence into the entropy and never normalised the result, which made a
+    50/50 split score only 0.69 - below the "high" threshold of 0.8.
+    """
+    report = core.consistency_report(answers, embedder=core.get_embedder(),
+                                     threshold=distance_threshold)
+    return {
+        "sindex": report["sindex"],
+        "n_clusters": report["n_clusters_sem"],
+        "clusters": report["clusters"],
+        "level": report["level"],
+        "verdict": report["verdict"],
+    }
+
+
+def multi_sample_check(model: str, prompt: str, n: int = 5) -> dict:
+    """Sample the same question n times and describe how much the answers vary."""
+    from collections import Counter
+
+    # No JSON/grammar constraint here: constrained decoding changes the answer
+    # distribution, and trust_eval.py samples without it.  Same generation
+    # settings in both files keeps the two measurements comparable.
+    short_prompt = f"{prompt}\n\nAnswer with only the direct entity."
+    answers = []
+    for i in range(n):
         try:
-            result = trust_radar.analyze(model, prompt)
-            text = result["text"]
-            entities = result["entities"]
-        except Exception as exc:                      # noqa: BLE001
-            st.error(f"Error in single-sample analysis: {exc}")
-            st.stop()
-
-    if result.get("alignment") not in (None, "exact"):
-        st.caption(f"note: token alignment fell back to '{result['alignment']}'")
-
-    st.subheader("Generated Text")
-    if entities:
-        render_annotated(text, entities)
-    else:
-        st.write(text)
-
-    st.subheader("Entity Confidence")
-    if entities:
-        rows = [
-            {
-                "Entity": e["text"],
-                "Type": e["label"],
-                "Mean prob": round(e["avg"], 3),
-                "Min prob": round(e["min"], 3),
-            }
-            for e in entities
-        ]
-        st.dataframe(rows, use_container_width=True)
-
-        df = pd.DataFrame(rows)
-        fig = px.bar(
-            df, x="Entity", y="Mean prob", color="Type",
-            range_y=[0, 1], title="Entity confidence (mean token probability)",
-        )
-        fig.add_hline(y=core.ENTITY_SAFE, line_dash="dash", line_color="green")
-        fig.add_hline(y=core.ENTITY_UNSURE, line_dash="dash", line_color="orange")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No factual entities detected in the generated text.")
-
-    # ---------- one consistency verdict, not two ----------
-    st.subheader("Cross-Sample Consistency")
-    with st.spinner(f"Sampling {n_samples} answers, please wait..."):
-        try:
-            ms = trust_radar.multi_sample_check(model, prompt, n=n_samples)
-        except Exception as exc:                      # noqa: BLE001
-            st.error(f"Error in multi-sample analysis: {exc}")
-            st.stop()
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Exact agreement", f"{ms['consistency']:.0%}")
-    col2.metric("Semantic clusters", ms["sindex_n_clusters"])
-    col3.metric("Top answer", (ms["top_entity"] or "-")[:20])
-
-    level_box(ms["level"], f"SINdex {ms['sindex']:.2f} — {ms['verdict']}")
-
-    with st.expander(f"Show {n_samples} sampled answers"):
-        for i, ans in enumerate(ms["samples"], 1):
-            st.write(f"**{i}.** {(ans or '(empty)')[:200]}")
-
-    with st.expander("Semantic cluster details"):
-        st.caption(
-            "Coherence = mean pairwise similarity inside a cluster. "
-            "Singletons have no internal disagreement, so coherence is 1.0 by convention."
-        )
-        for c in ms["sindex_clusters"]:
-            st.write(
-                f"**{(c['answer'] or '(empty)')[:60]}** — "
-                f"size={c['size']}, coherence={c['coherence']}, "
-                f"share={c['p']}, weight={c['weight']}"
+            resp = ollama.generate(
+                model=model,
+                prompt=short_prompt,
+                options={"temperature": 0.8, "seed": 42 + 17 * i, "num_predict": 32},
             )
+            raw = (resp.get("response") or "").strip().split("\n")[0].strip()
+            answers.append({"raw": raw, "key": core.normalize_answer(raw)})
+        except Exception:
+            answers.append({"raw": "", "key": ""})
+
+    report = core.consistency_report([a["raw"] for a in answers])
+
+    counter = Counter(a["key"] for a in answers if a["key"])
+    top_key = counter.most_common(1)[0][0] if counter else ""
+    top_raw = next((a["raw"] for a in answers if a["key"] == top_key), top_key)
+
+    return {
+        "samples": [a["raw"] for a in answers],
+        # exact-string agreement: a different question from SINdex, reported
+        # next to it, not turned into a second competing verdict
+        "consistency": report["consistency_exact"],
+        "unique_count": report["n_unique"],
+        "top_entity": top_raw,
+        # one verdict, produced by radar_core
+        "verdict": report["verdict"],
+        "level": report["level"],
+        "sindex": report["sindex"],
+        "sindex_n_clusters": report["n_clusters_sem"],
+        "sindex_clusters": report["clusters"],
+        "sindex_verdict": report["verdict"],
+        "sindex_level": report["level"],
+    }
