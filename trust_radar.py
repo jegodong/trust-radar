@@ -1,151 +1,339 @@
-"""trust_radar.py -- single-question pipeline behind the dashboard.
+"""trust_radar.py -- the full pipeline for one question.
 
-All confidence and consistency maths lives in radar_core.py so that the
-dashboard and the batch evaluation (trust_eval.py) can never disagree.
+    report = analyze("Who painted the Mona Lisa?", model="qwen2.5:3b")
+    report.decision      -> "PASS" | "VERIFY" | "ABSTAIN"
+    report.final_answer  -> what the user should be shown
 
-Public functions
-----------------
-    analyze(model, prompt)               one greedy answer + per-entity scores
-    multi_sample_check(model, prompt, n) N sampled answers + one verdict
+Steps
+-----
+1. Answer      one deterministic answer (temperature 0) with token logprobs
+2. Locate      spaCy entities in that answer, minus words copied from the
+               question; plain content words if spaCy finds nothing
+3. Score       weakest-token confidence per entity + what the model nearly
+               said instead (top-k alternatives)
+4. Resample    N answers at temperature > 0, same prompt, then count how many
+               agree with the shown answer
+5. Fuse        risk = 1 - (0.4 * confidence + 0.6 * support)
+6. Act         PASS shows the answer, VERIFY checks it against the local
+               knowledge base / Wikipedia and lets the model re-answer from
+               the evidence, ABSTAIN refuses
 """
 
-import json
-import math
-import os
+from __future__ import annotations
 
-import ollama
-import spacy
+import time
+from dataclasses import asdict, dataclass, field
 
+import llm
 import radar_core as core
+import retrieval
 
-DEFAULT_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+try:
+    import spacy
 
-nlp = spacy.load("en_core_web_sm")
+    try:
+        NLP = spacy.load("en_core_web_sm")
+    except OSError:
+        NLP = None
+except ImportError:                                     # pragma: no cover
+    NLP = None
 
-FACTUAL_ENTITIES = {
-    "PERSON", "GPE", "LOC", "ORG", "DATE",
-    "CARDINAL", "MONEY", "PERCENT", "QUANTITY",
-    "EVENT", "FAC", "NORP", "LAW",
+FACTUAL_LABELS = {
+    "PERSON", "GPE", "LOC", "ORG", "DATE", "TIME", "CARDINAL", "ORDINAL",
+    "MONEY", "PERCENT", "QUANTITY", "EVENT", "FAC", "NORP", "LAW",
+    "WORK_OF_ART", "PRODUCT", "LANGUAGE",
+}
+MONTHS = ("january", "february", "march", "april", "may", "june", "july",
+          "august", "september", "october", "november", "december")
+
+PROMPTS = {
+    "short": (
+        "You are a careful factual assistant. Answer the question with the "
+        "shortest complete answer - a name, number, date or short phrase - in "
+        "a single sentence. No explanation."
+    ),
+    "sentence": (
+        "You are a careful factual assistant. Answer the question in one or "
+        "two plain sentences. Be specific and do not hedge."
+    ),
 }
 
-MONTHS = (
-    "january", "february", "march", "april", "may", "june",
-    "july", "august", "september", "october", "november", "december",
+RAG_PROMPT = (
+    "Answer the question using ONLY the context below. Give the shortest "
+    "complete answer in one sentence. If the context does not contain the "
+    "answer, reply exactly: NOT IN CONTEXT\n\n"
+    "Context:\n{context}\n\nQuestion: {question}"
 )
 
+ABSTAIN_MESSAGE = "I can't verify this with enough certainty, so I won't guess."
 
-def is_factual_date(text: str) -> bool:
-    """Keep "1912" and "March 2020"; drop "yesterday" and "last week"."""
-    if any(ch.isdigit() for ch in text):
-        return True
+
+@dataclass
+class Report:
+    question: str
+    model: str
+    answer: str
+    decision: str
+    final_answer: str
+    final_status: str           # answered | verified | corrected | unverified | abstained
+    risk: float
+    confidence: float
+    support: float
+    entropy: float
+    entities: list = field(default_factory=list)
+    tokens: list = field(default_factory=list)       # [{text, p, top}]
+    key_source: str = "entities"
+    samples: list = field(default_factory=list)
+    clusters: list = field(default_factory=list)
+    verification: dict | None = None
+    alignment: str = "exact"
+    timings: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------
+# step 2-3: find and score the answer-bearing parts
+# --------------------------------------------------------------------------
+
+def _is_factual_date(text: str) -> bool:
     low = text.lower()
-    return any(month in low for month in MONTHS)
+    return any(ch.isdigit() for ch in text) or any(m in low for m in MONTHS)
 
 
-def analyze(model: str, prompt: str) -> dict:
-    """One deterministic answer, with every factual entity scored."""
-    response = ollama.generate(model=model, prompt=prompt, logprobs=True, top_logprobs=3)
-    text = response["response"]
+def _primary_entity(entities: list, question: str):
+    """
+    The entity that actually answers the question.
 
-    tokens = []
-    for item in response.get("logprobs") or []:
-        if item.get("logprob") is None:
-            continue
-        tokens.append({"token": item.get("token", ""), "p": math.exp(float(item["logprob"]))})
+    An answer often volunteers details nobody asked for ("the Pacific Ocean,
+    covering 63 million square kilometres").  Those extras should not be able
+    to veto an answer that is itself confident, so the decision is driven by
+    the entity whose type matches the question word.
+    """
+    q = question.lower()
+    if "how many" in q or "how much" in q or "percentage" in q:
+        prefer = {"CARDINAL", "QUANTITY", "PERCENT", "MONEY", "ORDINAL"}
+    elif "what year" in q or q.startswith("when"):
+        prefer = {"DATE", "TIME"}
+    elif q.startswith("who"):
+        prefer = {"PERSON", "ORG", "NORP"}
+    elif q.startswith("where"):
+        prefer = {"GPE", "LOC", "FAC"}
+    else:
+        prefer = {"PERSON", "GPE", "LOC", "ORG", "EVENT", "PRODUCT",
+                  "WORK_OF_ART", "NORP"}
+    for e in entities:
+        if e["label"] in prefer:
+            return e
+    return max(entities, key=lambda e: e["min"])
 
-    spans, status = core.align_tokens(text, tokens)
-    if spans is None:
-        return {"text": text, "entities": [], "alignment": status}
 
-    doc = nlp(text)
+def _key_spans(answer: str, question: str) -> tuple:
+    """Character spans worth scoring, plus where they came from."""
+    spans = []
+    if NLP is not None:
+        for ent in NLP(answer).ents:
+            if ent.label_ not in FACTUAL_LABELS:
+                continue
+            if ent.label_ == "DATE" and not _is_factual_date(ent.text):
+                continue
+            if not core.content_tokens(ent.text, question):
+                continue                    # entity only repeats the question
+            spans.append((ent.start_char, ent.end_char, ent.text, ent.label_))
+    if spans:
+        return spans, "entities"
+
+    # fallback: every content word that is not in the question
+    import re
+
+    q = core.content_tokens(question) | {
+        t for t in core.normalize_answer(question).split()}
+    for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9'\-\.]*[A-Za-z0-9]|[A-Za-z0-9]", answer):
+        word = m.group(0)
+        toks = core.content_tokens(word)
+        if toks and not toks <= q:
+            spans.append((m.start(), m.end(), word, "KEY"))
+    return spans, "content words"
+
+
+def score_answer(answer: str, tokens: list, question: str):
+    spans, status = core.align_tokens(answer, tokens)
+    heat = []
+    if spans:
+        heat = [{"text": s[4], "p": s[2],
+                 "top": [{"token": t["token"], "p": round(t["p"], 4)} for t in s[3]]}
+                for s in spans]
     entities = []
-    for ent in doc.ents:
-        if ent.label_ not in FACTUAL_ENTITIES:
-            continue
-        if ent.label_ == "DATE" and not is_factual_date(ent.text):
-            continue
-        probs = [p for start, end, p in spans if start < ent.end_char and end > ent.start_char]
-        if not probs:
-            continue
-        entities.append({
-            "text": ent.text,
-            "label": ent.label_,
-            "start": int(ent.start_char),
-            "end": int(ent.end_char),
-            "avg": sum(probs) / len(probs),
-            "min": min(probs),
-            "tokens": [text[start:end] for start, end, _ in spans
-                       if start < ent.end_char and end > ent.start_char],
-        })
+    if spans:
+        keys, source = _key_spans(answer, question)
+        for start, end, text, label in keys:
+            sc = core.score_span(spans, start, end, question)
+            if sc is None:
+                continue
+            entities.append({
+                "text": text, "label": label, "start": start, "end": end,
+                **sc, "level": core.level_for(sc["min"]),
+            })
+    else:
+        source = "none"
 
-    return {"text": text, "entities": entities, "alignment": status}
-
-
-def get_embedder():
-    return core.get_embedder()
+    if entities:
+        confidence = min(e["min"] for e in entities)
+    elif spans:
+        word_ps = [s[2] for s in spans if any(ch.isalnum() for ch in s[4])]
+        confidence = min(word_ps) if word_ps else 0.0
+    else:
+        confidence = 0.5                    # no logprobs: neutral, rely on support
+    return entities, heat, confidence, source, status
 
 
-def compute_sindex(answers, distance_threshold=None) -> dict:
-    """
-    Semantic inconsistency of a bag of answers.
+# --------------------------------------------------------------------------
+# step 4: equivalence back-ends
+# --------------------------------------------------------------------------
 
-    Thin wrapper over radar_core.consistency_report so the dashboard and
-    results.csv report the same score.  The old version mixed cluster
-    coherence into the entropy and never normalised the result, which made a
-    50/50 split score only 0.69 - below the "high" threshold of 0.8.
-    """
-    report = core.consistency_report(answers, embedder=core.get_embedder(),
-                                     threshold=distance_threshold)
-    return {
-        "sindex": report["sindex"],
-        "n_clusters": report["n_clusters_sem"],
-        "clusters": report["clusters"],
-        "level": report["level"],
-        "verdict": report["verdict"],
-    }
+def make_equivalence(kind: str, question: str, model: str):
+    """'lexical' (fast, default) or 'llm' (model judges paraphrases)."""
+    if kind != "llm":
+        return None
+    cache: dict = {}
+
+    def judge(a: str, b: str) -> bool:
+        if core.normalize_answer(a) == core.normalize_answer(b):
+            return True
+        key = tuple(sorted((a, b)))
+        if key not in cache:
+            prompt = (f"Question: {question}\nAnswer A: {a}\nAnswer B: {b}\n"
+                      "Do A and B give the same answer to the question? "
+                      "Reply with exactly one word: yes or no.")
+            out = llm.generate(model, prompt, temperature=0.0, num_predict=3).text
+            cache[key] = out.strip().lower().startswith("yes")
+        return cache[key]
+
+    return judge
 
 
-def multi_sample_check(model: str, prompt: str, n: int = 5) -> dict:
-    """Sample the same question n times and describe how much the answers vary."""
-    from collections import Counter
+# --------------------------------------------------------------------------
+# step 6: verification
+# --------------------------------------------------------------------------
 
-    # No JSON/grammar constraint here: constrained decoding changes the answer
-    # distribution, and trust_eval.py samples without it.  Same generation
-    # settings in both files keeps the two measurements comparable.
-    short_prompt = f"{prompt}\n\nAnswer with only the direct entity."
-    answers = []
-    for i in range(n):
+def verify(question: str, answer: str, model: str, use_local: bool = True,
+           use_wikipedia: bool = True, equivalent=None) -> dict:
+    t0 = time.time()
+    passages = retrieval.retrieve(question, use_local, use_wikipedia)
+    result = {"passages": [p.__dict__ for p in passages], "status": "no_evidence",
+              "rag_answer": "", "coverage": 0.0, "seconds": 0.0}
+    if not passages:
+        result["seconds"] = time.time() - t0
+        return result
+
+    context = "\n\n".join(f"[{p.title}] {p.text}" for p in passages)[:6000]
+    rag = llm.generate(model, RAG_PROMPT.format(context=context, question=question),
+                       temperature=0.0, num_predict=64).text.strip()
+    result["rag_answer"] = rag
+    result["coverage"] = retrieval.evidence_coverage(answer, passages, question)
+    rag_coverage = retrieval.evidence_coverage(rag, passages, question)
+    eq = equivalent or (lambda x, y: core.answers_equivalent(x, y, question))
+
+    if "not in context" in rag.lower() or not rag:
+        result["status"] = "no_evidence"
+    elif eq(answer, rag) and result["coverage"] >= 0.5:
+        result["status"] = "supported"
+    elif rag_coverage >= 0.5:
+        result["status"] = "contradicted"
+    else:
+        result["status"] = "inconclusive"
+    result["seconds"] = time.time() - t0
+    return result
+
+
+# --------------------------------------------------------------------------
+# the whole thing
+# --------------------------------------------------------------------------
+
+def analyze(question: str, model: str = llm.DEFAULT_MODEL, n_samples: int = 5,
+            temperature: float = 0.8, mode: str = "short", do_verify: bool = True,
+            use_local: bool = True, use_wikipedia: bool = True,
+            equivalence: str = "lexical", risk_low: float = core.RISK_LOW,
+            risk_high: float = core.RISK_HIGH, w_conf: float = core.W_CONFIDENCE,
+            w_sup: float = core.W_SUPPORT, verify_all: bool = False,
+            progress=None) -> Report:
+    system = PROMPTS.get(mode, PROMPTS["short"])
+    timings = {}
+
+    def step(msg):
+        if progress:
+            progress(msg)
+
+    step("Generating answer")
+    t0 = time.time()
+    g = llm.generate(model, question, system=system, temperature=0.0, seed=0,
+                     num_predict=96, logprobs=True, top_logprobs=5)
+    timings["answer"] = time.time() - t0
+    answer_raw = g.text
+    answer = answer_raw.strip()
+
+    entities, heat, confidence, source, status = score_answer(answer_raw, g.tokens, question)
+
+    # The headline confidence belongs to the entity that answers the question.
+    # A volunteered detail ("covering 63 million km2") must not make a correct
+    # answer look unsure; it is still highlighted, just not decisive.
+    primary = _primary_entity(entities, question) if entities else None
+    if primary is not None:
+        confidence = primary["min"]
+    weakest = min((e["min"] for e in entities), default=confidence)
+
+    step(f"Resampling {n_samples} answers")
+    t0 = time.time()
+    samples = []
+    for i in range(n_samples):
         try:
-            resp = ollama.generate(
-                model=model,
-                prompt=short_prompt,
-                options={"temperature": 0.8, "seed": 42 + 17 * i, "num_predict": 32},
-            )
-            raw = (resp.get("response") or "").strip().split("\n")[0].strip()
-            answers.append({"raw": raw, "key": core.normalize_answer(raw)})
-        except Exception:
-            answers.append({"raw": "", "key": ""})
+            s = llm.generate(model, question, system=system, temperature=temperature,
+                             seed=1000 + 17 * i, num_predict=96).text.strip()
+        except Exception:                               # noqa: BLE001
+            s = ""
+        samples.append(s)
+    timings["samples"] = time.time() - t0
 
-    report = core.consistency_report([a["raw"] for a in answers])
+    eq = make_equivalence(equivalence, question, model)
+    cons = core.consistency(answer, samples, question, eq)
 
-    counter = Counter(a["key"] for a in answers if a["key"])
-    top_key = counter.most_common(1)[0][0] if counter else ""
-    top_raw = next((a["raw"] for a in answers if a["key"] == top_key), top_key)
+    # Two different questions, two different numbers:
+    #   confidence  what to show  - the fact that answers the question
+    #   weakest     what to score - the shakiest fact anywhere in the answer,
+    #               so a volunteered detail still lowers trust (sensitivity)
+    risk = core.risk_score(weakest, cons.support, w_conf, w_sup)
+    decision = core.triage(risk, risk_low, risk_high)
 
-    return {
-        "samples": [a["raw"] for a in answers],
-        # exact-string agreement: a different question from SINdex, reported
-        # next to it, not turned into a second competing verdict
-        "consistency": report["consistency_exact"],
-        "unique_count": report["n_unique"],
-        "top_entity": top_raw,
-        # one verdict, produced by radar_core
-        "verdict": report["verdict"],
-        "level": report["level"],
-        "sindex": report["sindex"],
-        "sindex_n_clusters": report["n_clusters_sem"],
-        "sindex_clusters": report["clusters"],
-        "sindex_verdict": report["verdict"],
-        "sindex_level": report["level"],
-    }
+    # ...but a weak detail may only downgrade a confident answer to VERIFY.
+    # It must never veto an answer whose own fact is solid.
+    if decision == core.ABSTAIN and primary and primary["min"] >= core.ENTITY_SAFE:
+        decision = core.VERIFY
+
+    verification = None
+    final_answer, final_status = answer, "answered"
+    if decision == core.ABSTAIN:
+        final_answer, final_status = ABSTAIN_MESSAGE, "abstained"
+    elif decision == core.VERIFY or (verify_all and decision == core.PASS):
+        if do_verify:
+            step("Checking evidence")
+            verification = verify(question, answer, model, use_local, use_wikipedia, eq)
+            timings["verify"] = verification["seconds"]
+            vs = verification["status"]
+            if vs == "supported":
+                final_status = "verified"
+            elif vs == "contradicted":
+                final_answer, final_status = verification["rag_answer"], "corrected"
+            else:
+                final_status = "answered" if decision == core.PASS else "unverified"
+        else:
+            final_status = "unverified"
+
+    return Report(
+        question=question, model=model, answer=answer, decision=decision,
+        final_answer=final_answer, final_status=final_status,
+        risk=risk, confidence=confidence, support=cons.support,
+        entropy=cons.entropy, entities=entities, tokens=heat, key_source=source,
+        samples=cons.samples, clusters=cons.clusters, verification=verification,
+        alignment=status, timings=timings,
+    )
