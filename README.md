@@ -1,7 +1,5 @@
 # Trust Radar: Confidence Radar for LLMs
 
-**Project P15** · Dong Jego, CHAN Siu Man, CHAN Siu Ming
-
 LLMs state false facts with the same confidence as true ones. Trust Radar sits between a
 local Ollama model and the user. It measures how sure the model really was about each fact,
 checks whether the model gives the same answer when asked again, and then **passes**,
