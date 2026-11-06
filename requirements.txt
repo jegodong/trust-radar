@@ -1,9 +1,7 @@
-streamlit
-ollama
-spacy
-plotly
-pandas
-requests
-numpy
-scikit-learn
-sentence-transformers
+ollama>=0.6
+streamlit>=1.40
+plotly>=5.20
+pandas>=2.0
+spacy>=3.7,<4
+requests>=2.31
+pytest>=8

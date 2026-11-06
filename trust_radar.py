@@ -14,9 +14,9 @@ Steps
 4. Resample    N answers at temperature > 0, same prompt, then count how many
                agree with the shown answer
 5. Fuse        risk = 1 - (0.4 * confidence + 0.6 * support)
-6. Act         PASS shows the answer, VERIFY checks it against the local
-               knowledge base / Wikipedia and lets the model re-answer from
-               the evidence, ABSTAIN refuses
+6. Act         PASS shows the answer.  VERIFY checks it on Wikipedia and lets
+               the model re-answer from the evidence.  ABSTAIN also checks
+               Wikipedia first and refuses only if no evidence is found.
 """
 
 from __future__ import annotations
@@ -86,6 +86,8 @@ class Report:
     samples: list = field(default_factory=list)
     clusters: list = field(default_factory=list)
     verification: dict | None = None
+    second_opinion: dict | None = None   # {model, answer, agrees, seconds}
+    escalated: bool = False              # PASS -> VERIFY because the second model disagreed
     alignment: str = "exact"
     timings: dict = field(default_factory=dict)
 
@@ -100,33 +102,6 @@ class Report:
 def _is_factual_date(text: str) -> bool:
     low = text.lower()
     return any(ch.isdigit() for ch in text) or any(m in low for m in MONTHS)
-
-
-def _primary_entity(entities: list, question: str):
-    """
-    The entity that actually answers the question.
-
-    An answer often volunteers details nobody asked for ("the Pacific Ocean,
-    covering 63 million square kilometres").  Those extras should not be able
-    to veto an answer that is itself confident, so the decision is driven by
-    the entity whose type matches the question word.
-    """
-    q = question.lower()
-    if "how many" in q or "how much" in q or "percentage" in q:
-        prefer = {"CARDINAL", "QUANTITY", "PERCENT", "MONEY", "ORDINAL"}
-    elif "what year" in q or q.startswith("when"):
-        prefer = {"DATE", "TIME"}
-    elif q.startswith("who"):
-        prefer = {"PERSON", "ORG", "NORP"}
-    elif q.startswith("where"):
-        prefer = {"GPE", "LOC", "FAC"}
-    else:
-        prefer = {"PERSON", "GPE", "LOC", "ORG", "EVENT", "PRODUCT",
-                  "WORK_OF_ART", "NORP"}
-    for e in entities:
-        if e["label"] in prefer:
-            return e
-    return max(entities, key=lambda e: e["min"])
 
 
 def _key_spans(answer: str, question: str) -> tuple:
@@ -217,10 +192,18 @@ def make_equivalence(kind: str, question: str, model: str):
 # step 6: verification
 # --------------------------------------------------------------------------
 
-def verify(question: str, answer: str, model: str, use_local: bool = True,
-           use_wikipedia: bool = True, equivalent=None) -> dict:
+def verify(question: str, answer: str, model: str, use_wikipedia: bool = True,
+           equivalent=None, candidates: tuple = ()) -> dict:
+    """
+    Check the answer against Wikipedia.
+
+    1. retrieve   search by keywords and by every candidate answer
+    2. re-answer  the model answers again using ONLY the retrieved text
+    3. compare    same as before -> supported; different and backed by the
+                  evidence -> contradicted (the evidence answer replaces it)
+    """
     t0 = time.time()
-    passages = retrieval.retrieve(question, use_local, use_wikipedia)
+    passages = retrieval.retrieve(question, use_wikipedia, (answer, *candidates))
     result = {"passages": [p.__dict__ for p in passages], "status": "no_evidence",
               "rag_answer": "", "coverage": 0.0, "seconds": 0.0}
     if not passages:
@@ -253,10 +236,11 @@ def verify(question: str, answer: str, model: str, use_local: bool = True,
 
 def analyze(question: str, model: str = llm.DEFAULT_MODEL, n_samples: int = 5,
             temperature: float = 0.8, mode: str = "short", do_verify: bool = True,
-            use_local: bool = True, use_wikipedia: bool = True,
+            use_wikipedia: bool = True,
             equivalence: str = "lexical", risk_low: float = core.RISK_LOW,
             risk_high: float = core.RISK_HIGH, w_conf: float = core.W_CONFIDENCE,
             w_sup: float = core.W_SUPPORT, verify_all: bool = False,
+            second_model: str | None = None,
             progress=None) -> Report:
     system = PROMPTS.get(mode, PROMPTS["short"])
     timings = {}
@@ -275,14 +259,6 @@ def analyze(question: str, model: str = llm.DEFAULT_MODEL, n_samples: int = 5,
 
     entities, heat, confidence, source, status = score_answer(answer_raw, g.tokens, question)
 
-    # The headline confidence belongs to the entity that answers the question.
-    # A volunteered detail ("covering 63 million km2") must not make a correct
-    # answer look unsure; it is still highlighted, just not decisive.
-    primary = _primary_entity(entities, question) if entities else None
-    if primary is not None:
-        confidence = primary["min"]
-    weakest = min((e["min"] for e in entities), default=confidence)
-
     step(f"Resampling {n_samples} answers")
     t0 = time.time()
     samples = []
@@ -298,36 +274,58 @@ def analyze(question: str, model: str = llm.DEFAULT_MODEL, n_samples: int = 5,
     eq = make_equivalence(equivalence, question, model)
     cons = core.consistency(answer, samples, question, eq)
 
-    # Two different questions, two different numbers:
-    #   confidence  what to show  - the fact that answers the question
-    #   weakest     what to score - the shakiest fact anywhere in the answer,
-    #               so a volunteered detail still lowers trust (sensitivity)
-    risk = core.risk_score(weakest, cons.support, w_conf, w_sup)
+    risk = core.risk_score(confidence, cons.support, w_conf, w_sup)
     decision = core.triage(risk, risk_low, risk_high)
 
-    # ...but a weak detail may only downgrade a confident answer to VERIFY.
-    # It must never veto an answer whose own fact is solid.
-    if decision == core.ABSTAIN and primary and primary["min"] >= core.ENTITY_SAFE:
-        decision = core.VERIFY
+    # Second opinion: a different model answers the same question blind (it
+    # never sees the first answer, so it cannot simply agree with it).  If it
+    # disagrees, a PASS is escalated to VERIFY.  Agreement never lowers risk:
+    # two models can share the same misconception.
+    second, escalated = None, False
+    if second_model:
+        step(f"Asking {second_model} for a second opinion")
+        t0 = time.time()
+        try:
+            other = llm.generate(second_model, question, system=system, temperature=0.0,
+                                 seed=0, num_predict=96).text.strip()
+            agrees = (eq or (lambda x, y: core.answers_equivalent(x, y, question)))(answer, other)
+            second = {"model": second_model, "answer": other, "agrees": bool(agrees),
+                      "seconds": time.time() - t0}
+            if not agrees and decision == core.PASS:
+                decision, escalated = core.VERIFY, True
+        except Exception as exc:                        # noqa: BLE001
+            second = {"model": second_model, "answer": "", "agrees": None,
+                      "error": f"{type(exc).__name__}: {exc}", "seconds": time.time() - t0}
+        timings["second"] = time.time() - t0
+
+    # Every answer in play is searched on Wikipedia, so the evidence can
+    # confirm the model OR one of its rivals.
+    candidates = [c["answer"] for c in cons.clusters[:3]]
+    if second and second.get("answer"):
+        candidates.append(second["answer"])
+    for e in entities:
+        candidates += [a["token"].strip() for a in e["alternatives"][:2]
+                       if a["token"].strip().isalpha() and len(a["token"].strip()) >= 3]
 
     verification = None
     final_answer, final_status = answer, "answered"
-    if decision == core.ABSTAIN:
+    wants_check = (decision in (core.VERIFY, core.ABSTAIN)
+                   or (verify_all and decision == core.PASS))
+    if wants_check and do_verify and use_wikipedia:
+        step("Checking Wikipedia")
+        verification = verify(question, answer, model, use_wikipedia, eq, tuple(candidates))
+        timings["verify"] = verification["seconds"]
+    vs = verification["status"] if verification else None
+
+    if vs == "supported":
+        final_status = "verified"                 # evidence backs the model
+    elif vs == "contradicted":
+        final_answer, final_status = verification["rag_answer"], "corrected"
+    elif decision == core.ABSTAIN:
+        # too uncertain AND no usable evidence -> refuse instead of guessing
         final_answer, final_status = ABSTAIN_MESSAGE, "abstained"
-    elif decision == core.VERIFY or (verify_all and decision == core.PASS):
-        if do_verify:
-            step("Checking evidence")
-            verification = verify(question, answer, model, use_local, use_wikipedia, eq)
-            timings["verify"] = verification["seconds"]
-            vs = verification["status"]
-            if vs == "supported":
-                final_status = "verified"
-            elif vs == "contradicted":
-                final_answer, final_status = verification["rag_answer"], "corrected"
-            else:
-                final_status = "answered" if decision == core.PASS else "unverified"
-        else:
-            final_status = "unverified"
+    elif decision == core.VERIFY:
+        final_status = "unverified"
 
     return Report(
         question=question, model=model, answer=answer, decision=decision,
@@ -335,5 +333,6 @@ def analyze(question: str, model: str = llm.DEFAULT_MODEL, n_samples: int = 5,
         risk=risk, confidence=confidence, support=cons.support,
         entropy=cons.entropy, entities=entities, tokens=heat, key_source=source,
         samples=cons.samples, clusters=cons.clusters, verification=verification,
+        second_opinion=second, escalated=escalated,
         alignment=status, timings=timings,
     )
